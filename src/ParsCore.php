@@ -2,8 +2,6 @@
 
 namespace ParsCore\Laravel;
 
-use Illuminate\Support\Facades\Log;
-
 /**
  * ParsCore class for parsing and evaluating conditions with a simple syntax: `fn[param1,param2,...]`.
  * Supports logical operators and extensible custom commands.
@@ -20,21 +18,21 @@ class ParsCore
         'AND' => [
             'handler' => [self::class, 'handleAnd'],
             'params' => [
-                ['type' => 'condition', 'required' => true, 'multiple' => true],
+                ['type' => 'any', 'required' => true, 'multiple' => true],
             ],
             'type' => 'condition',
         ],
         'OR' => [
             'handler' => [self::class, 'handleOr'],
             'params' => [
-                ['type' => 'condition', 'required' => true, 'multiple' => true],
+                ['type' => 'any', 'required' => true, 'multiple' => true],
             ],
             'type' => 'condition',
         ],
         'NOT' => [
             'handler' => [self::class, 'handleNot'],
             'params' => [
-                ['type' => 'condition', 'required' => true],
+                ['type' => 'any', 'required' => true],
             ],
             'type' => 'condition',
         ],
@@ -100,9 +98,25 @@ class ParsCore
     }
 
     /**
+     * Log messages and data for debugging.
+     *
+     * @param array|string $data Data to log
+     * @return void
+     */
+    protected function logger($data): void
+    {
+        // Currently using var_dump for output; can be extended to file logging or Laravel's Log
+        // var_dump($data);
+        // Example for future file logging:
+        // file_put_contents(storage_path('logs/parscore.log'), print_r($data, true) . PHP_EOL, FILE_APPEND);
+        // Example for Laravel logging:
+        // \Illuminate\Support\Facades\Log::debug('ParsCore', is_array($data) ? $data : ['message' => $data]);
+    }
+
+    /**
      * Parse a command string and evaluate its result.
      *
-     * @param string|null $input The command string (e.g., "AND[equals[1,1],greater_than[10,5]]")
+     * @param string|null $input The command string (e.g., "AND[true,true]")
      * @param mixed $context Optional context
      * @return mixed Boolean for conditions, void or other for actions
      */
@@ -113,6 +127,7 @@ class ParsCore
         }
 
         $tree = $this->buildSyntaxTree($input);
+        $this->logger(['Syntax tree' => $tree]);
         return $this->evaluateSyntaxTree($tree, $context);
     }
 
@@ -125,6 +140,7 @@ class ParsCore
     protected function buildSyntaxTree(string $input): array
     {
         $tokens = $this->tokenize($input);
+        $this->logger(['Tokens' => $tokens]);
         return $this->parseTokens($tokens);
     }
 
@@ -139,24 +155,21 @@ class ParsCore
         $tokens = [];
         $current = '';
         $inBracket = 0;
-        $inParams = false;
 
         for ($i = 0; $i < strlen($input); $i++) {
             $char = $input[$i];
 
             if ($char === '[') {
                 $inBracket++;
-                $inParams = true;
                 $current .= $char;
             } elseif ($char === ']') {
                 $inBracket--;
                 $current .= $char;
-                if ($inBracket === 0) {
-                    $inParams = false;
+                if ($inBracket === 0 && $current) {
+                    $tokens[] = $current;
+                    $current = '';
                 }
-            } elseif ($char === ',' && $inBracket === 1 && $inParams) {
-                $current .= $char;
-            } elseif ($char === ',' && !$inParams) {
+            } elseif ($char === ',' && $inBracket === 0) {
                 if ($current) {
                     $tokens[] = $current;
                     $current = '';
@@ -188,32 +201,48 @@ class ParsCore
             $parts = explode('[', $token, 2);
             $node['name'] = $parts[0];
             if (isset($parts[1])) {
-                $params = rtrim($parts[1], ']');
-                $node['params'] = $params ? explode(',', $params) : [];
+                $paramsStr = rtrim($parts[1], ']');
+                $params = [];
+                $currentParam = '';
+                $inNestedBracket = 0;
+
+                for ($i = 0; $i < strlen($paramsStr); $i++) {
+                    $char = $paramsStr[$i];
+                    if ($char === '[') {
+                        $inNestedBracket++;
+                        $currentParam .= $char;
+                    } elseif ($char === ']') {
+                        $inNestedBracket--;
+                        $currentParam .= $char;
+                    } elseif ($char === ',' && $inNestedBracket === 0 && $currentParam !== '') {
+                        $params[] = trim($currentParam);
+                        $currentParam = '';
+                    } else {
+                        $currentParam .= $char;
+                    }
+                }
+
+                if ($currentParam !== '') {
+                    $params[] = trim($currentParam);
+                }
+
+                $node['params'] = $params;
             }
             return $node;
         }
 
         $node['name'] = array_shift($tokens);
-        $params = [];
-        $currentParam = '';
-
+        $children = [];
         foreach ($tokens as $token) {
-            if ($token === ',') {
-                if ($currentParam) {
-                    $params[] = $this->buildSyntaxTree($currentParam);
-                    $currentParam = '';
-                }
-                continue;
+            if (in_array(strtolower($token), ['true', 'false']) || is_numeric($token)) {
+                $children[] = ['type' => 'value', 'value' => $token];
+            } else {
+                $children[] = $this->buildSyntaxTree($token);
             }
-            $currentParam .= ($currentParam ? ',' : '') . $token;
         }
+        $node['children'] = $children;
 
-        if ($currentParam) {
-            $params[] = $this->buildSyntaxTree($currentParam);
-        }
-
-        $node['children'] = $params;
+        $this->logger(['Parsed node' => $node]);
         return $node;
     }
 
@@ -226,27 +255,60 @@ class ParsCore
      */
     protected function evaluateSyntaxTree(array $node, $context = null): mixed
     {
+        if ($node['type'] === 'value') {
+            $value = $node['value'];
+            if (strtolower($value) === 'true') {
+                return true;
+            }
+            if (strtolower($value) === 'false') {
+                return false;
+            }
+            if (is_numeric($value)) {
+                return (int)$value;
+            }
+            return $value;
+        }
+
         if (!isset(static::$commands[$node['name']])) {
-            $this->logError("Command {$node['name']} is not defined", $node['name'], $node['params']);
-            return isset(static::$commands[$node['name']]['type']) && static::$commands[$node['name']]['type'] === 'condition' ? false : null;
+            $this->logger(['Error' => "Command {$node['name']} is not defined", 'params' => $node['params']]);
+            return static::$commands[$node['name']]['type'] ?? 'condition' === 'condition' ? false : null;
         }
 
         $commandConfig = static::$commands[$node['name']];
 
         $params = [];
-        foreach ($node['children'] as $child) {
-            $params[] = $this->evaluateSyntaxTree($child, $context);
+        if (!empty($node['children'])) {
+            foreach ($node['children'] as $child) {
+                $params[] = $this->evaluateSyntaxTree($child, $context);
+            }
+        } else {
+            foreach ($node['params'] as $param) {
+                if (is_numeric($param)) {
+                    $params[] = (int)$param;
+                } elseif (strtolower($param) === 'true') {
+                    $params[] = true;
+                } elseif (strtolower($param) === 'false') {
+                    $params[] = false;
+                } elseif (strpos($param, '[') !== false) {
+                    $params[] = $this->parse($param, $context);
+                } else {
+                    $params[] = $param;
+                }
+            }
         }
 
+        $this->logger(['Evaluating command' => $node['name'], 'params' => $params]);
+
         if (!$this->validateParams($params, $commandConfig['params'], $node['name'])) {
-            $this->logError("Invalid parameters for {$node['name']}", $node['name'], $params);
+            $this->logger(['Error' => "Invalid parameters for {$node['name']}", 'params' => $params, 'expected' => $commandConfig['params']]);
             return $commandConfig['type'] === 'condition' ? false : null;
         }
 
         try {
-            return call_user_func($commandConfig['handler'], $params, $context);
+            $this->logger(['Executing handler' => $node['name'], 'params' => $params]);
+            return call_user_func($commandConfig['handler'], $params, $context, $this);
         } catch (\Exception $e) {
-            $this->logError("Error executing command {$node['name']}: {$e->getMessage()}", $node['name'], $params);
+            $this->logger(['Error' => "Error executing command {$node['name']}: {$e->getMessage()}", 'params' => $params]);
             return $commandConfig['type'] === 'condition' ? false : null;
         }
     }
@@ -263,42 +325,23 @@ class ParsCore
     {
         $requiredCount = count(array_filter($schema, fn($s) => $s['required']));
         if (count($params) < $requiredCount) {
+            $this->logger(['Error' => "Not enough parameters for {$commandName}", 'provided' => $params, 'required' => $requiredCount]);
             return false;
         }
 
         if ($commandName === 'NOT' && count($params) !== 1) {
+            $this->logger(['Error' => "NOT command requires exactly one parameter", 'provided' => $params]);
             return false;
         }
 
         foreach ($schema as $index => $rule) {
             if (!isset($params[$index]) && $rule['required']) {
+                $this->logger(['Error' => "Missing required parameter at index {$index} for {$commandName}", 'provided' => $params]);
                 return false;
-            }
-            if (isset($params[$index])) {
-                $value = $params[$index];
-                if ($rule['type'] === 'condition' && !is_bool($value)) {
-                    return false;
-                }
-                // 'any' type allows any value
             }
         }
 
         return true;
-    }
-
-    /**
-     * Log an error with details.
-     *
-     * @param string $message Error message
-     * @param string $command Command name
-     * @param array $params Command parameters
-     */
-    protected function logError(string $message, string $command, array $params): void
-    {
-        Log::error("ParsCore: {$message}", [
-            'command' => $command,
-            'params' => $params,
-        ]);
     }
 
     // Logical operators
@@ -306,14 +349,17 @@ class ParsCore
     /**
      * Handle the `AND` logical operator.
      *
-     * @param array $params Array of evaluated conditions
+     * @param array $params Array of conditions (any type)
      * @param mixed $context Optional context
+     * @param ParsCore|null $parser Parser instance for logging
      * @return bool
      */
-    protected static function handleAnd(array $params, $context = null): bool
+    protected static function handleAnd(array $params, $context = null, ?ParsCore $parser = null): bool
     {
-        foreach ($params as $condition) {
-            if (!$condition) {
+        $parser?->logger(['Inside handleAnd' => $params]);
+        foreach ($params as $param) {
+            $result = static::toBoolean($param);
+            if (!$result) {
                 return false;
             }
         }
@@ -323,14 +369,17 @@ class ParsCore
     /**
      * Handle the `OR` logical operator.
      *
-     * @param array $params Array of evaluated conditions
+     * @param array $params Array of conditions (any type)
      * @param mixed $context Optional context
+     * @param ParsCore|null $parser Parser instance for logging
      * @return bool
      */
-    protected static function handleOr(array $params, $context = null): bool
+    protected static function handleOr(array $params, $context = null, ?ParsCore $parser = null): bool
     {
-        foreach ($params as $condition) {
-            if ($condition) {
+        $parser?->logger(['Inside handleOr' => $params]);
+        foreach ($params as $param) {
+            $result = static::toBoolean($param);
+            if ($result) {
                 return true;
             }
         }
@@ -340,13 +389,35 @@ class ParsCore
     /**
      * Handle the `NOT` logical operator.
      *
-     * @param array $params Single condition
+     * @param array $params Single condition (any type)
      * @param mixed $context Optional context
+     * @param ParsCore|null $parser Parser instance for logging
      * @return bool
      */
-    protected static function handleNot(array $params, $context = null): bool
+    protected static function handleNot(array $params, $context = null, ?ParsCore $parser = null): bool
     {
-        return !$params[0];
+        $parser?->logger(['Inside handleNot' => $params]);
+        return !static::toBoolean($params[0]);
+    }
+
+    /**
+     * Convert a value to boolean.
+     *
+     * @param mixed $value Value to convert
+     * @return bool
+     */
+    protected static function toBoolean($value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_numeric($value)) {
+            return $value != 0;
+        }
+        if (is_string($value)) {
+            return !empty($value);
+        }
+        return (bool)$value;
     }
 
     // Basic PHP conditions
@@ -356,10 +427,12 @@ class ParsCore
      *
      * @param array $params [value1, value2]
      * @param mixed $context Optional context
+     * @param ParsCore|null $parser Parser instance for logging
      * @return bool
      */
-    protected static function handleEquals(array $params, $context = null): bool
+    protected static function handleEquals(array $params, $context = null, ?ParsCore $parser = null): bool
     {
+        $parser?->logger(['Inside handleEquals' => $params]);
         return $params[0] === $params[1];
     }
 
@@ -368,10 +441,12 @@ class ParsCore
      *
      * @param array $params [value1, value2]
      * @param mixed $context Optional context
+     * @param ParsCore|null $parser Parser instance for logging
      * @return bool
      */
-    protected static function handleGreaterThan(array $params, $context = null): bool
+    protected static function handleGreaterThan(array $params, $context = null, ?ParsCore $parser = null): bool
     {
+        $parser?->logger(['Inside handleGreaterThan' => $params]);
         return $params[0] > $params[1];
     }
 
@@ -380,10 +455,12 @@ class ParsCore
      *
      * @param array $params [value1, value2]
      * @param mixed $context Optional context
+     * @param ParsCore|null $parser Parser instance for logging
      * @return bool
      */
-    protected static function handleLessThan(array $params, $context = null): bool
+    protected static function handleLessThan(array $params, $context = null, ?ParsCore $parser = null): bool
     {
+        $parser?->logger(['Inside handleLessThan' => $params]);
         return $params[0] < $params[1];
     }
 }
